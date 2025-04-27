@@ -17,8 +17,10 @@
 
 use bevy::{ecs::system::SystemParam, prelude::*};
 use bevy_impulse::*;
+use chrono::Local;
 use rfd::AsyncFileDialog;
 use std::path::PathBuf;
+use std::{env, fs, time::Duration};
 
 use crate::interaction::InteractionState;
 use crate::site::{DefaultFile, LoadSite, SaveSite};
@@ -109,7 +111,8 @@ impl Plugin for WorkspacePlugin {
             .add_systems(
                 Update,
                 (dispatch_new_workspace_events, sync_workspace_visibility),
-            );
+            )
+            .add_plugins(BackupPlugin);
     }
 }
 
@@ -465,7 +468,7 @@ pub struct WorkspaceLoader<'w, 's> {
 
 /// Handles the file saving events
 fn send_file_save(
-    In(BlockingService { request, .. }): BlockingServiceInput<(PathBuf, ExportFormat)>,
+    In(BlockingService { request, .. }): BlockingServiceInput<(PathBuf, ExportFormat, bool)>,
     app_state: Res<State<AppState>>,
     mut save_site: EventWriter<SaveSite>,
     current_workspace: Res<CurrentWorkspace>,
@@ -480,6 +483,7 @@ fn send_file_save(
                 site: ws_root,
                 to_file: request.0,
                 format: request.1,
+                skip_migration: request.2,
             });
         }
         AppState::MainMenu => { /* Noop */ }
@@ -499,6 +503,8 @@ pub struct WorkspaceSavingServices {
     pub export_sdf_to_dialog: Service<(), ()>,
     /// Exports the requested workspace as an SDF in the requested path.
     pub export_sdf_to_path: Service<PathBuf, ()>,
+    /// Saves workspace backup to requested path
+    pub save_workspace_backup: Service<PathBuf, ()>,
 }
 
 impl FromWorld for WorkspaceSavingServices {
@@ -528,7 +534,7 @@ impl FromWorld for WorkspaceSavingServices {
                 .chain(builder)
                 .map_block(move |_| saving_filters.clone())
                 .then(pick_file)
-                .map_block(|path| (path, ExportFormat::default()))
+                .map_block(|path| (path, ExportFormat::default(), false))
                 .then(send_file_save)
                 .connect(scope.terminate)
         });
@@ -536,7 +542,7 @@ impl FromWorld for WorkspaceSavingServices {
             scope
                 .input
                 .chain(builder)
-                .map_block(|path| (path, ExportFormat::default()))
+                .map_block(|path| (path, ExportFormat::default(), false))
                 .then(send_file_save)
                 .connect(scope.terminate)
         });
@@ -558,7 +564,7 @@ impl FromWorld for WorkspaceSavingServices {
                 .input
                 .chain(builder)
                 .then(pick_folder)
-                .map_block(|path| (path, ExportFormat::Sdf))
+                .map_block(|path| (path, ExportFormat::Sdf, false))
                 .then(send_file_save)
                 .connect(scope.terminate)
         });
@@ -566,7 +572,15 @@ impl FromWorld for WorkspaceSavingServices {
             scope
                 .input
                 .chain(builder)
-                .map_block(|path| (path, ExportFormat::Sdf))
+                .map_block(|path| (path, ExportFormat::Sdf, false))
+                .then(send_file_save)
+                .connect(scope.terminate)
+        });
+        let save_workspace_backup = world.spawn_workflow(|scope, builder| {
+            scope
+                .input
+                .chain(builder)
+                .map_block(|path| (path, ExportFormat::default(), true))
                 .then(send_file_save)
                 .connect(scope.terminate)
         });
@@ -577,6 +591,7 @@ impl FromWorld for WorkspaceSavingServices {
             save_workspace_to_default_file,
             export_sdf_to_dialog,
             export_sdf_to_path,
+            save_workspace_backup,
         }
     }
 }
@@ -621,6 +636,13 @@ impl<'w, 's> WorkspaceSaver<'w, 's> {
             .request(path, self.workspace_saving.export_sdf_to_path)
             .detach();
     }
+
+    /// Request to save backup to provided path
+    pub fn save_backup(&mut self, path: PathBuf) {
+        self.commands
+            .request(path, self.workspace_saving.save_workspace_backup)
+            .detach();
+    }
 }
 
 /// `SystemParam` used to request for workspace loading operations
@@ -657,5 +679,83 @@ pub fn sync_workspace_visibility(
             }
         }
         recall.0 = current_workspace.root;
+    }
+}
+
+#[derive(Resource)]
+struct BackupTimer(Timer);
+
+pub struct BackupPlugin;
+
+impl Plugin for BackupPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(BackupTimer(Timer::new(
+            Duration::from_secs(3600),
+            TimerMode::Repeating,
+        )))
+        .add_systems(Startup, create_backup_directory)
+        .add_systems(Update, create_workspace_backup);
+    }
+}
+
+fn create_backup_directory() {
+    if let Some(cache_dir) = get_backup_directory() {
+        if !cache_dir.exists() {
+            match fs::create_dir_all(&cache_dir) {
+                Ok(_) => info!("Created backup directory: {}", cache_dir.display()),
+                Err(e) => error!(
+                    "Failed to create backup directory {}: {}",
+                    cache_dir.display(),
+                    e
+                ),
+            }
+        } else {
+            info!("Backups will be saved to {}", cache_dir.display());
+        }
+    } else {
+        error!("Failed to determine directory for backups");
+    }
+}
+
+fn get_backup_directory() -> Option<PathBuf> {
+    env::var("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("rmf_site_editor")
+                .join("backups")
+        })
+        .ok()
+}
+
+fn create_workspace_backup(
+    time: Res<Time>,
+    mut timer: ResMut<BackupTimer>,
+    current_workspace: Res<CurrentWorkspace>,
+    mut saver: WorkspaceSaver,
+    default_file: Query<&DefaultFile>,
+) {
+    let Some(_) = current_workspace.root else {
+        return;
+    };
+
+    if timer.0.tick(time.delta()).just_finished() {
+        if let Some(backup_path) = get_backup_directory() {
+            if let Ok(default_file) = default_file.get(current_workspace.root.unwrap()) {
+                let original_filename = default_file.0.file_stem().unwrap_or_default();
+                let extension = default_file.0.extension().unwrap_or_default();
+                let now = Local::now();
+                let filename = format!(
+                    "backup-{}-{}.{}",
+                    now.format("%Y%m%d-%H%M%S"),
+                    original_filename.to_string_lossy(),
+                    extension.to_string_lossy()
+                );
+                let path = backup_path.join(filename);
+
+                info!("Saving workspace backup to {:?}", path);
+                saver.save_backup(path);
+            }
+        }
     }
 }

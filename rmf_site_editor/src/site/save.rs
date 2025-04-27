@@ -33,6 +33,7 @@ pub struct SaveSite {
     pub site: Entity,
     pub to_file: PathBuf,
     pub format: ExportFormat,
+    pub skip_migration: bool,
 }
 
 #[derive(Event)]
@@ -1496,7 +1497,9 @@ pub fn save_site(world: &mut World) {
                 };
 
                 let old_default_path = world.get::<DefaultFile>(save_event.site).cloned();
-                migrate_relative_paths(save_event.site, &new_path, world);
+                if !save_event.skip_migration {
+                    migrate_relative_paths(save_event.site, &new_path, world);
+                }
 
                 let site = match generate_site(world, save_event.site) {
                     Ok(site) => site,
